@@ -1,74 +1,42 @@
-First naive implementation is going to just go with a similar approach that I've used for previous
-floating point designs
+This commit has the exact same design and verilog code. It just optimizes 
+the boolean logic. 
 
-where we convert the floating point numbers into some fixed point format to make the multiplication easy
+For instructions on design architecture, see previous commit (first commit)
 
-but instead of normalizing back to floating point keep it in fixed format.
+To summarize, I used following optimizations:
 
-for fp4, we have just one mantissa bit, so we either have x.0 or x.1 (either no decimal or .5)
+- eff_ea/eff_eb: mux against a constant is dumb, just OR the bits directly, no mux needed
+- sh - 2: constant subtract, fold it straight into the adder outputs instead of a second adder
+- barrel shifter: shifted-in bits are known 0s, most muxes collapse down to a single AND
+- final negate line: Don't need mux logic with sign bit as select line, can just do bitwise XOR with sign bit. And then since we're adding by constant we can just use a half adder which is only 2 logic gates (AND and OR) 
 
-BUT since we know we're going to be multiplying by 4 anyways, we can just multiply each input operand by 2
-and now when we multiply these inputs this already handles the multiply by 4 as 2x2=4
+line by line breakdown below (numbers for the verilog code as written, none of it changed - just
+how you map each line to gates changed)
 
-this gets rid of the decimal value too because .5*2=1
-so now for the 'mantissa' previously we had
-0.1, 1.0, or 1.1
-So now its 01.0, 10.0, 11.0
+assign siga = {ea[1]|ea[0], ma};
+assign sigb = {eb[1]|eb[0], mb}; - 2 gates total (1 OR each, ma/mb are direct wires)
 
-this is the same thing, but just the significance is doubled
+old: assign eff_ea = (ea == 2'd0) ? 2'd1 : ea;
+new: assign eff_ea = {ea[1], ea[0] | !ea[1]}; 
+- if e1 is 1 the value is
+already >=2 so e0 doesn't matter, and if e1 is 0 you're going to have 1 anyways, regardless of what ea[0] is. So just one NOT and OR gate - 4 gates total for both
+eff_ea and eff_eb
 
-product of these two is a 4 bit integer value
+assign mp = siga * sigb; - 4 partial product ANDs + 2 XOR/AND pairs to combine them - 8 gates
 
-and now we just shift left by (ea - bias) + (eb - bias), where the bias for fp4 is 1
+assign sh = eff_ea + eff_eb - 3'd2; - 2 bit adder for eff_ea+eff_eb 
+- (2 gates for first bit half adder, then 5 gates for 2nd bit full adder: 2+5= 7 gates) t
+Then have to add -2 - apparently since its a constant it can be done in just 2 more logic gates. To be honest don't fully understand how this process works but synthesis tools should manage this themslevss normally. 
 
-we have to fill the upper remaining bits with 0s
+assign mag = 9'(mp) << sh; - barrel shifter, 3 mux stages, but a lot of the shifted-in bits are
+known 0s so most of those muxes collapse down to a single AND - 41 gates
 
-this gives us an unsigned integer value, and to get a signed integer value we just 2s complement
-which is just negation + 1!!
+assign s = sa ^ sb; - 1 gate
 
+old: assign p = s ? (~mag + 9'd1) : mag;
+new: assign p = (mag ^ {9{s}}) + s; - instead of computing ~mag+1 and mag separately and muxing
+between them, XOR every bit with s first (that's the invert-if-negative part) then add s (not a
+constant 1 - has to be s, since we only want +1 when negating) - one pass does the invert, the
++1, and the select together - 25 gates
 
-I'm writing verilog solution to get something done quick, and then I can reason as to how it would map onto logic gates
-
-I know a 1 bit full adder is 5 logic gates
-         a 1 bit mux is 4 logic gates
-         a 2 bit multiplier is 8 logic gates
-
-assign siga = {ea[1]|ea[0], ma}; - 1 logic gate
-assign sigb = {eb[1]|eb[0], mb}; - 1 logic gate
-
- assign eff_ea = (ea == 2'd0) ? 2'd1 : ea;
- ea == 2'd0 - to check if a bit is 0, you can NOT it and then AND it with a 1 - therefore 2 bits per bit
- given there are 2 bits, there are 4 logic gates involved
-
- This is followed by a 2 bit mux, which is 8 logic gates
-
- Therefore this one line is 12 logic gates
-
- assign eff_eb = (eb == 2'd0) ? 2'd1 : eb; - also 12 logic gates
-
- assign mp = siga * sigb; - 8 logic gates
-
- assign sh = eff_ea + eff_eb - 3'd2; - adding eff_ea+eff_eb needs a 2 bit adder (10 gates), then
- subtracting 3'd2 is another add, this time a 3 bit adder (15 gates) - therefore this line is 25 gates
-
- assign mag = 9'(mp) << sh; - shift amount here is a signal not a constant, so this is a real
- barrel shifter, not free - 3 mux stages (shift by 1, then 2, then 4) - about 21 muxes total,
- 4 gates each - 84 gates
-
- assign s = sa ^ sb; - 1 gate
-
- assign p = s ? (~mag + 9'd1) : mag;
-
- ~mag is inverting every bit, for all 9 bits - 9 gates
-
- followed by a 9 bit adder - 45 gates
-
- followed by a 9 bit mux - 36 gates
-
- therefore this one line takes 9 + 45 + 36 = 90 gates
-
-total: 1+1+12+12+8+25+84+1+90 = 234 gates
-
-things to optimize next: barrel shifter is the biggest cost by far (84 gates) so that's the first
-target, and a lot of the rest is just not exploiting constants - ex. the eff_ea/eff_eb mux against
-a constant, the +1 against a constant, should all collapse way down
+total: 2+4+8+9+41+1+25 = 90 gates, verified all 256 cases pass (fp4.py)
