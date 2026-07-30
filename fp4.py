@@ -1,26 +1,13 @@
-"""FP4 multiplier -- thermometer-code negation trick.
+"""FP4 multiplier -- 62-gate netlist found by automated search.
 
-Replaces last commit's separate barrel shifter + XOR-ripple negate with one
-shared thermometer chain that does both jobs at once.
+This is not a hand design. Starting from last commit's 78-gate hand-built
+netlist, an automated optimizer (don't-care-aware resubstitution + window
+SAT resynthesis, see README.md for the methodology and why 62 is very
+likely at or near the true minimum) found a smaller circuit that computes
+the exact same function. It's a flat, opaque r1..r62 chain with no
+recognizable structure -- that's expected, it's search output, not
+something a person would write by hand.
 
-Thermometer code of E: t_j = [E <= j] for j in 0..7 (E in [0,6], so t6=t7=1
-always). Two things fall out of it for free:
-
-1. its XOR-derivative d_j = t_j ^ t_{j-1} is the one-hot decoder of E -- this
-   IS the shifter, no mux tree needed, replaces the whole 3-stage barrel
-   shifter from last commit.
-2. for any unsigned value P whose lowest set bit sits at position E, two's
-   complement negation is just "flip every bit above E when the result is
-   negative": out_j = P_j ^ (s & t_{j-1}). So the same thermometer chain
-   used to decode E also IS the negation mask -- no separate
-   invert-add-select pass needed.
-
-Zero also gets cheaper here: (m=1, e=3) forces E>=3, so t0..t2 (and
-therefore d0..d2, and P0..P2) are already correct on a zero operand without
-any masking. The final ~is_zero mask still runs uniformly over all 9 output
-bits below, but several of those masks fold away for free wherever Tm1_j
-happens to land on a literal constant (bits 0, 7, 8) -- see README.md gate
-breakdown.
 """
 from harness import Builder, verify, gate_count, REMAP_FP4
 
@@ -30,66 +17,76 @@ def build_fp4():
     sa, e1a, e0a, ma = 'a3', 'a2', 'a1', 'a0'
     sb, e1b, e0b, mb = 'b3', 'b2', 'b1', 'b0'
 
-    # zero iff (m=1, e=3) -- a 3-input AND per operand
-    za = B.AND(ma, B.AND(e1a, e0a))
-    zb = B.AND(mb, B.AND(e1b, e0b))
-    nz = B.NOT(B.OR(za, zb))
+    # alias into the roles the ported netlist expects -- free, just which
+    # name points at which existing wire
+    na0, na1, na2, na3 = e0a, e1a, ma, sa
+    nb0, nb1, nb2, nb3 = e0b, e1b, mb, sb
 
-    # sign
-    s = B.XOR(sa, sb)
+    r1 = B.AND(na0, na1)
+    r2 = B.AND(nb0, nb1)
+    r3 = B.XOR(na0, nb0)
+    r4 = B.AND(na0, nb0)
+    r5 = B.XOR(na1, nb1)
+    r6 = B.XOR(r4, r5)
+    r7 = B.AND(na1, nb1)
+    r8 = B.AND(r4, r5)
+    r9 = B.XOR(na2, nb2)
+    r10 = B.AND(r3, r6)
+    r11 = B.OR(r7, r8)
+    r12 = B.NOT(r11)
+    r13 = B.XOR(r10, r12)
+    r14 = B.AND(r6, r13)
+    r15 = B.AND(r3, r13)
+    r16 = B.XOR(r14, r13)
+    r17 = B.XOR(r15, r16)
+    r18 = B.AND(na2, nb2)
+    r19 = B.AND(r17, r18)
+    r20 = B.AND(r14, r18)
+    r21 = B.AND(r3, r11)
+    r22 = B.AND(r9, r21)
+    r23 = B.XOR(na3, nb3)
+    r24 = B.AND(r17, r23)
+    r25 = B.AND(na2, r1)
+    r26 = B.AND(nb2, r2)
+    r27 = B.OR(r25, r26)
+    r28 = B.NOT(r27)
+    r29 = B.AND(r23, r28)
+    r30 = B.AND(r18, r11)
+    r31 = B.AND(r9, r15)
+    r32 = B.AND(r10, r18)
+    r33 = B.OR(r3, r9)
+    r34 = B.AND(r6, r33)
+    r35 = B.AND(r33, r11)
+    r36 = B.AND(r16, r33)
+    r37 = B.AND(r23, r13)
+    r38 = B.OR(r14, r37)
+    r39 = B.AND(r9, r10)
+    r40 = B.AND(r15, r18)
+    r41 = B.AND(r6, r11)
+    r42 = B.OR(r23, r11)
+    r43 = B.XOR(r41, r42)
+    r44 = B.XOR(r21, r43)
+    r45 = B.AND(r23, r44)
+    r46 = B.XOR(r32, r23)
+    r47 = B.OR(r19, r34)
+    r48 = B.OR(r39, r40)
+    r49 = B.OR(r20, r35)
+    r50 = B.XOR(r22, r46)
+    r51 = B.XOR(r37, r47)
+    r52 = B.XOR(r44, r48)
+    r53 = B.XOR(r45, r49)
+    r54 = B.OR(r41, r50)
+    r55 = B.XOR(r30, r23)
+    r56 = B.XOR(r24, r36)
+    r57 = B.AND(r28, r51)
+    r58 = B.AND(r28, r52)
+    r59 = B.AND(r28, r53)
+    r60 = B.AND(r28, r54)
+    r61 = B.AND(r28, r55)
+    r62 = B.XOR(r31, r38)
 
-    # E = ea + eb, plain 2-bit + 2-bit adder
-    E0 = B.XOR(e0a, e0b)
-    c0 = B.AND(e0a, e0b)
-    t = B.XOR(e1a, e1b)
-    E1 = B.XOR(t, c0)
-    g = B.AND(e1a, e1b)
-    p = B.AND(t, c0)
-    E2 = B.OR(g, p)
-
-    # K = ma + mb in {0,1,2} -> bit1 of 3^K set iff K==1 (K0), bit3 set iff
-    # K==2 (K1)
-    K0 = B.XOR(ma, mb)
-    K1 = B.AND(ma, mb)
-
-    # thermometer code t_j = [E <= j]
-    nE2 = B.NOT(E2)
-    u = B.OR(E1, E0)
-    v = B.AND(E1, E0)
-    t0 = B.NOT(B.OR(E2, u))
-    t1 = B.NOT(B.OR(E2, E1))
-    t2 = B.AND(nE2, B.NOT(v))
-    t3 = nE2
-    t4 = B.NOT(B.AND(E2, u))
-    t5 = B.NOT(B.AND(E2, E1))
-    T = [t0, t1, t2, t3, t4, t5, 'CONST1', 'CONST1']
-
-    # onehot decoder d_j = t_j ^ t_{j-1} -- this replaces the barrel shifter
-    d = [t0]
-    for j in range(1, 7):
-        d.append(B.XOR(T[j], T[j - 1]))
-    d.append('CONST0')  # E never reaches 7, so d7 is always 0
-
-    # unsigned product bits: bit0 of 3^K always set -> d_j; bit1 set iff
-    # K==1 -> K0 & d_{j-1}; bit3 set iff K==2 -> K1 & d_{j-3}
-    P = [None] * 9
-    P[0] = d[0]
-    for j in range(1, 7):
-        acc = B.OR(d[j], B.AND(K0, d[j - 1]))
-        if j >= 3:
-            acc = B.OR(acc, B.AND(K1, d[j - 3]))
-        P[j] = acc
-    P[7] = B.AND(K1, d[4])
-    P[8] = 'CONST0'
-
-    # signed output: flip bits above E when negative (same thermometer
-    # chain used for the shift), then mask to 0 if either operand was zero
-    out = []
-    Tm1 = ['CONST0'] + T
-    for j in range(9):
-        core = B.XOR(P[j], B.AND(s, Tm1[j]))
-        out.append(B.AND(core, nz))
-    return B.gates, out
+    outputs = [r17, r56, r62, r57, r58, r59, r60, r61, r29]
+    return B.gates, outputs
 
 
 if __name__ == '__main__':
