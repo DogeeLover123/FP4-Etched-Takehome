@@ -22,6 +22,14 @@ Conventions:
 # code -> 2*value:
 STANDARD_FP4 = (0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12)
 
+# Remapped encoding, code bits (b3 b2 b1 b0) = (s, e1, e0, m) -- same bit
+# order as standard FP4, only what the bits mean changes:
+#   value = (-1)^s * (1 + 2m) * 2^(e-1), with (m=1, e=3) standing in for zero
+#   (that (m,e) combo would be 3*2^3=24, which isn't a real fp4 magnitude, so
+#   both signs of it are free to reuse as the two zero codes).
+# code -> 2*value:
+REMAP_FP4 = (1, 3, 2, 6, 4, 12, 8, 0, -1, -3, -2, -6, -4, -12, -8, 0)
+
 MASK256 = (1 << 256) - 1
 
 

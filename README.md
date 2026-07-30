@@ -1,42 +1,66 @@
-This commit has the exact same design and verilog code. It just optimizes 
-the boolean logic. 
+This commit switches the input encoding from standard FP4 to a custom remap.
+Same architecture as last commit (barrel shifter + XOR-negate trick) - the
+win here is entirely from a smarter code assignment, not a new circuit trick.
 
-For instructions on design architecture, see previous commit (first commit)
+so the key idea is since that we know we have to multiply by 4 anyways, its
+good to double each of the operands. 2*2=4 so then that already accounts for
+the 4x. its also good because we get rid of decimal.
 
-To summarize, I used following optimizations:
+Now the input operands are 0,1,2,3,4,6,8,12, (also + or -) and we see this is
+{1,3}*2^{0,1,2,3}. except the case for 3*2^3=24 doesn't exist (we only have
+up to 12) so this is perfect as we can use this to represent 0.
 
-- eff_ea/eff_eb: mux against a constant is dumb, just OR the bits directly, no mux needed
-- sh - 2: constant subtract, fold it straight into the adder outputs instead of a second adder
-- barrel shifter: shifted-in bits are known 0s, most muxes collapse down to a single AND
-- final negate line: Don't need mux logic with sign bit as select line, can just do bitwise XOR with sign bit. And then since we're adding by constant we can just use a half adder which is only 2 logic gates (AND and OR) 
+for the exponent {0,1,2,3}, we can use the existing 2 bit exponent so that
+part is the same. the sign bit is also the same, so the only thing that is
+different is that now the mantissa bit just represents either 1, or 3.
 
-line by line breakdown below (numbers for the verilog code as written, none of it changed - just
-how you map each line to gates changed)
+code bits stay in the same order as standard FP4, (s, e1, e0, m) - only what
+they mean changes: value = (-1)^s * (1+2m) * 2^(e-1), zero lives at (m=1,
+e=3) for both signs (that's the "24" combo that doesn't exist).
 
-assign siga = {ea[1]|ea[0], ma};
-assign sigb = {eb[1]|eb[0], mb}; - 2 gates total (1 OR each, ma/mb are direct wires)
+what this buys you over standard FP4:
 
-old: assign eff_ea = (ea == 2'd0) ? 2'd1 : ea;
-new: assign eff_ea = {ea[1], ea[0] | !ea[1]}; 
-- if e1 is 1 the value is
-already >=2 so e0 doesn't matter, and if e1 is 0 you're going to have 1 anyways, regardless of what ea[0] is. So just one NOT and OR gate - 4 gates total for both
-eff_ea and eff_eb
+- no more subnormal handling. old design needed a mux to bump e=0 up to
+  "effective exponent or eff" 1. this new design just feeds e straight into the adder, 
+  so no such case exists anymore.
+- no more real 2x2 significand multiplier. old mp was a genuine 2bit x 2bit
+  multiply (4 partial-product ANDs + carry combine). new mp only has to 
+  represent 3 values: {1,3,9}. This can be represented by 3^K!! 
+  K = ma+mb in {0,1,2}. 
+  Since K only is 4'b0001, 4'b0011, 4'b1001, notice only bit 1 and bit 3 change - selected by 2 gates (K's bits), no multiplier array at all!!
+- exponent add loses its "-2" correction. old design computed
+  eff_ea+eff_eb-2 (folded into the adder outputs). new E = ea+eb directly -
+  the remap's built-in 2^(e-1) already accounts for what the "-2" used to
+  do, so the raw adder output feeds the shifter unmodified.
+- zero handling changes shape. old design got zero for free out of the
+  significand (m=0,e=0 naturally multiplies to 0). new design needs an
+  explicit check instead: an operand is zero iff (m=1 and e=3), a 3-input
+  AND. OR that across both operands, then AND it across all 9 output bits
+  at the very end.
 
-assign mp = siga * sigb; - 4 partial product ANDs + 2 XOR/AND pairs to combine them - 8 gates
+barrel shifter and final negate are otherwise structurally identical to the
+previous commit (same "shifted-in bits are known 0" collapse, same
+XOR+ripple negate-and-add-sign trick). Shift range grew from 0-4 to 0-6
+since there's no more "-2" to shrink it, but that's still a 3-bit shift
+amount either way, so no extra shifter stage was needed.
 
-assign sh = eff_ea + eff_eb - 3'd2; - 2 bit adder for eff_ea+eff_eb 
-- (2 gates for first bit half adder, then 5 gates for 2nd bit full adder: 2+5= 7 gates) t
-Then have to add -2 - apparently since its a constant it can be done in just 2 more logic gates. To be honest don't fully understand how this process works but synthesis tools should manage this themslevss normally. 
+gate breakdown (fp4.py):
 
-assign mag = 9'(mp) << sh; - barrel shifter, 3 mux stages, but a lot of the shifted-in bits are
-known 0s so most of those muxes collapse down to a single AND - 41 gates
+- zero check (za, zb, is_zero, ~is_zero): 6
+- sign (sa^sb): 1
+- exponent adder (E = ea+eb, 2bit+2bit): 7
+- K (ma+mb, picks the 3^K pattern): 2
+- barrel shift stage 1 (shift by E0, 0/1): 6
+- barrel shift stage 2 (shift by E1, 0/2): 14
+- barrel shift stage 3 (shift by E2, 0/4): 18
+- negate (XOR by sign + ripple add sign): 26
+- final zero mask (AND every output bit with ~is_zero): 9
 
-assign s = sa ^ sb; - 1 gate
+total: 89 gates, verified all 256 cases pass (fp4.py + rtl/tb.sv via
+verilator)
 
-old: assign p = s ? (~mag + 9'd1) : mag;
-new: assign p = (mag ^ {9{s}}) + s; - instead of computing ~mag+1 and mag separately and muxing
-between them, XOR every bit with s first (that's the invert-if-negative part) then add s (not a
-constant 1 - has to be s, since we only want +1 when negating) - one pass does the invert, the
-+1, and the select together - 25 gates
-
-total: 2+4+8+9+41+1+25 = 90 gates, verified all 256 cases pass (fp4.py)
+only 1 gate less than last commit (90) even though the remap saves ~14 gates
+(no real multiplier, no -2 fold, more constant-folding in the shifter)
+almost all of it gets eaten by the new 9-gate zero mask ({9{~is_zero}}), which standard FP4
+got for free and this encoding doesn't. next commit will have
+to find a solution for this...

@@ -15,32 +15,33 @@ module fp4_mul (
     assign eb = b[2:1];
     assign mb = b[0];
 
+    // zero iff (m=1, e=3)
+    // this (m,e) combo is unused by real fp4 values,
+    // so both signs of it double as the zero codes
+    logic za, zb, is_zero;
+    assign za = ma & ea[1] & ea[0];
+    assign zb = mb & eb[1] & eb[0];
+    assign is_zero = za | zb;
 
-    // significand: 2 bit x.x value that we multiply together
-    logic [1:0] siga, sigb;
+    // exponent sum - no subrnomal correction needed now! 
+    // there is also 0 bias to account for
+    logic [2:0] E;
+    assign E = ea + eb;
 
-    // upper bit is 1 if not subnormal: we know its not subnormal if any of the bits are 1 so bitwise OR
-    assign siga = {ea[1]|ea[0], ma};
-    assign sigb = {eb[1]|eb[0], mb};
-    // effective exponent: subnormals have e=1
-    logic [1:0] eff_ea, eff_eb;
-    assign eff_ea = {ea[1], ea[0] | !ea[1]};
-    assign eff_eb = {eb[1], eb[0] | !eb[1]};
-
-    // 2x2 bit significand multiply is a 4 bit output
+    // K = ma + mb in {0,1,2} picks the significand product 3^K in {1,3,9}
+    // K = 4'b0001, 4'b0011, 4'b1001 which is a fixed pattern with only bit 3 and bit 1 changing
+    logic [1:0] K;
     logic [3:0] mp;
-    assign mp = siga * sigb;
+    assign K  = ma + mb; // NOTE: adding 2 1 bit numbers is just a half adder
+    assign mp = {K[1], 1'b0, K[0], 1'b1};
 
-    // max value of eff_ea + eff_eb - 2 is 3+3-2=4 which needs 3 bits to represent
-    logic [2:0] sh;
-    assign sh = eff_ea + eff_eb - 3'd2;
-
-    // shift to convert into unsigned integer value -- NOT free, see comment block above
+    // shift to convert into unsigned integer value
     logic [8:0] mag;
-    assign mag = 9'(mp) << sh;
+    assign mag = 9'(mp) << E;
 
-    // 2s complement if product is negative
+    // 2s complement if product is negative, then mask to 0 if either
+    // operand was zero
     logic s;
     assign s = sa ^ sb;
-    assign p = (mag ^ {9{s}}) + s;
+    assign p = ((mag ^ {9{s}}) + s) & {9{~is_zero}};
 endmodule

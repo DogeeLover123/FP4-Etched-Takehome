@@ -6,15 +6,15 @@ module tb;
 
     fp4_mul dut (.a(a), .b(b), .p(p));
 
-    // standard FP4 code -> 2*value
+    // remapped code {s,e1,e0,m} -> 2*value; (m=1,e=3) is zero, both signs
     function automatic int v2(input logic [3:0] c);
         case (c)
-            4'b0000: return 0;   4'b0001: return 1;   4'b0010: return 2;
-            4'b0011: return 3;   4'b0100: return 4;   4'b0101: return 6;
-            4'b0110: return 8;   4'b0111: return 12;  4'b1000: return 0;
-            4'b1001: return -1;  4'b1010: return -2;  4'b1011: return -3;
-            4'b1100: return -4;  4'b1101: return -6;  4'b1110: return -8;
-            default: return -12;
+            4'b0000: return 1;   4'b0001: return 3;   4'b0010: return 2;
+            4'b0011: return 6;   4'b0100: return 4;   4'b0101: return 12;
+            4'b0110: return 8;   4'b0111: return 0;   4'b1000: return -1;
+            4'b1001: return -3;  4'b1010: return -2;  4'b1011: return -6;
+            4'b1100: return -4;  4'b1101: return -12; 4'b1110: return -8;
+            default: return 0;
         endcase
     endfunction
 
