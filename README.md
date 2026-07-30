@@ -1,66 +1,55 @@
-This commit switches the input encoding from standard FP4 to a custom remap.
-Same architecture as last commit (barrel shifter + XOR-negate trick) - the
-win here is entirely from a smarter code assignment, not a new circuit trick.
+the problem: last commit's 2s complement was the single biggest block in the whole design. we have to reduce this. The is_zero 9-bit mask
+is also fairly expensive. 
 
-so the key idea is since that we know we have to multiply by 4 anyways, its
-good to double each of the operands. 2*2=4 so then that already accounts for
-the 4x. its also good because we get rid of decimal.
+this is where I have to start extensively using claude to hyper optimize the above. 
 
-Now the input operands are 0,1,2,3,4,6,8,12, (also + or -) and we see this is
-{1,3}*2^{0,1,2,3}. except the case for 3*2^3=24 doesn't exist (we only have
-up to 12) so this is perfect as we can use this to represent 0.
+the key idea: flip-then-add-1 is mathematically the same operation as "find
+P's lowest set bit at position E, leave everything below E at 0, leave bit
+E at 1, flip everything above E" - the carry chain rippling through P's
+trailing zeros stops the instant it hits that lowest 1, so that's all the
+carry chain was ever doing. normally though finding the lowest set bit at runtime is also very expensive
 
-for the exponent {0,1,2,3}, we can use the existing 2 bit exponent so that
-part is the same. the sign bit is also the same, so the only thing that is
-different is that now the mantissa bit just represents either 1, or 3.
+it's free for us specifically because our P isn't an arbitrary number: it's
+3^K (always odd, bit0 always set) shifted left by E, so its lowest set bit
+is *structurally* guaranteed to land exactly at E - nothing to search for at
+runtime. and E isn't extra work either, it's the exact same value already
+needed to place P's bits in the first place. so build a thermometer code of
+E - t_j = [E <= j] for j=0..7 (E in [0,6], so t6=t7=1 always for free) - and
+two things fall out of the one chain:
 
-code bits stay in the same order as standard FP4, (s, e1, e0, m) - only what
-they mean changes: value = (-1)^s * (1+2m) * 2^(e-1), zero lives at (m=1,
-e=3) for both signs (that's the "24" combo that doesn't exist).
+1. one-hot decode: d_j = t_j ^ t_{j-1} is exactly which bit position the
+   product lands on - this IS the barrel shifter, no mux tree needed.
+2. negation: out_j = P_j ^ (s & t_{j-1}) is exactly "flip bits above E when
+   negative, leave the rest alone" - the same t-chain used to place P also
+   IS the negation mask. no separate invert+add+select pass needed.
 
-what this buys you over standard FP4:
-
-- no more subnormal handling. old design needed a mux to bump e=0 up to
-  "effective exponent or eff" 1. this new design just feeds e straight into the adder, 
-  so no such case exists anymore.
-- no more real 2x2 significand multiplier. old mp was a genuine 2bit x 2bit
-  multiply (4 partial-product ANDs + carry combine). new mp only has to 
-  represent 3 values: {1,3,9}. This can be represented by 3^K!! 
-  K = ma+mb in {0,1,2}. 
-  Since K only is 4'b0001, 4'b0011, 4'b1001, notice only bit 1 and bit 3 change - selected by 2 gates (K's bits), no multiplier array at all!!
-- exponent add loses its "-2" correction. old design computed
-  eff_ea+eff_eb-2 (folded into the adder outputs). new E = ea+eb directly -
-  the remap's built-in 2^(e-1) already accounts for what the "-2" used to
-  do, so the raw adder output feeds the shifter unmodified.
-- zero handling changes shape. old design got zero for free out of the
-  significand (m=0,e=0 naturally multiplies to 0). new design needs an
-  explicit check instead: an operand is zero iff (m=1 and e=3), a 3-input
-  AND. OR that across both operands, then AND it across all 9 output bits
-  at the very end.
-
-barrel shifter and final negate are otherwise structurally identical to the
-previous commit (same "shifted-in bits are known 0" collapse, same
-XOR+ripple negate-and-add-sign trick). Shift range grew from 0-4 to 0-6
-since there's no more "-2" to shrink it, but that's still a 3-bit shift
-amount either way, so no extra shifter stage was needed.
+zero gets cheaper too, as a side effect rather than something hand-coded: a
+zero operand forces E>=3 (since (m=1,e=3) is the zero code), so t0,t1,t2 are
+already 0 automatically whenever an operand is zero - only the upper
+thermometer bits actually depend on ~is_zero to be correct. the netlist
+still ANDs ~is_zero uniformly across all 9 output bits (simpler to write
+than special-casing which bits need it), but several of those masks fold
+away for free anyway wherever the negation term happens to land on a
+literal constant instead of a real signal (bits 0, 7, 8 - see breakdown).
 
 gate breakdown (fp4.py):
 
-- zero check (za, zb, is_zero, ~is_zero): 6
+- zero check (za, zb, ~is_zero): 6
 - sign (sa^sb): 1
-- exponent adder (E = ea+eb, 2bit+2bit): 7
+- exponent adder (E = ea+eb): 7
 - K (ma+mb, picks the 3^K pattern): 2
-- barrel shift stage 1 (shift by E0, 0/1): 6
-- barrel shift stage 2 (shift by E1, 0/2): 14
-- barrel shift stage 3 (shift by E2, 0/4): 18
-- negate (XOR by sign + ripple add sign): 26
-- final zero mask (AND every output bit with ~is_zero): 9
+- thermometer code (t0..t5): 13
+- onehot decode (d1..d6): 6
+- product assembly (P0..P7): 21
+- signed output (negate + zero mask, folded together): 22
 
-total: 89 gates, verified all 256 cases pass (fp4.py + rtl/tb.sv via
+total: 78 gates, verified all 256 cases pass (fp4.py + rtl/tb.sv via
 verilator)
 
-only 1 gate less than last commit (90) even though the remap saves ~14 gates
-(no real multiplier, no -2 fold, more constant-folding in the shifter)
-almost all of it gets eaten by the new 9-gate zero mask ({9{~is_zero}}), which standard FP4
-got for free and this encoding doesn't. next commit will have
-to find a solution for this...
+down from 89 last commit, -11 gates. the front end (zero check, sign,
+exponent adder, K) is untouched at 16 gates either way. everything after
+that - old barrel shifter (38) + ripple negate (26) + zero mask (9) = 73
+gates - collapses into thermometer (13) + onehot decode (6) + product
+assembly (21) + signed output (22) = 62 gates. same math, same zero
+handling, one shared thermometer chain doing double duty instead of two
+separate pieces of logic.

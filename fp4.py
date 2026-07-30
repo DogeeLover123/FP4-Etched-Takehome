@@ -1,18 +1,26 @@
-"""FP4 multiplier -- input remapped to (s, m, e1, e0).
+"""FP4 multiplier -- thermometer-code negation trick.
 
-value = (-1)^s * (1 + 2m) * 2^(e-1), with (m=1, e=3) reused as the zero code
-(both signs) since 3*2^3=24 isn't a real fp4 magnitude. See harness.py's
-REMAP_FP4 for the code -> value table, README.md for the full derivation.
+Replaces last commit's separate barrel shifter + XOR-ripple negate with one
+shared thermometer chain that does both jobs at once.
 
-For nonzero operands: 4*va*vb = (-1)^s * 3^K * 2^E, K = ma+mb in {0,1,2},
-E = ea+eb in [0,6] -- no -2 correction needed this time, the "-1" baked into
-the value formula and the spec's "*4" cancel exactly. 3^K in {1,3,9} is just
-a constant 4-bit pattern selected by K, so no real significand multiplier is
-needed at all (K only takes 3 values).
+Thermometer code of E: t_j = [E <= j] for j in 0..7 (E in [0,6], so t6=t7=1
+always). Two things fall out of it for free:
 
-Still using the same barrel-shifter + XOR-negate machinery as the last two
-commits for now -- the shift-in-zero and negation-specific tricks are next
-commit.
+1. its XOR-derivative d_j = t_j ^ t_{j-1} is the one-hot decoder of E -- this
+   IS the shifter, no mux tree needed, replaces the whole 3-stage barrel
+   shifter from last commit.
+2. for any unsigned value P whose lowest set bit sits at position E, two's
+   complement negation is just "flip every bit above E when the result is
+   negative": out_j = P_j ^ (s & t_{j-1}). So the same thermometer chain
+   used to decode E also IS the negation mask -- no separate
+   invert-add-select pass needed.
+
+Zero also gets cheaper here: (m=1, e=3) forces E>=3, so t0..t2 (and
+therefore d0..d2, and P0..P2) are already correct on a zero operand without
+any masking. The final ~is_zero mask still runs uniformly over all 9 output
+bits below, but several of those masks fold away for free wherever Tm1_j
+happens to land on a literal constant (bits 0, 7, 8) -- see README.md gate
+breakdown.
 """
 from harness import Builder, verify, gate_count, REMAP_FP4
 
@@ -30,7 +38,7 @@ def build_fp4():
     # sign
     s = B.XOR(sa, sb)
 
-    # E = ea + eb, plain 2-bit + 2-bit adder, no correction needed
+    # E = ea + eb, plain 2-bit + 2-bit adder
     E0 = B.XOR(e0a, e0b)
     c0 = B.AND(e0a, e0b)
     t = B.XOR(e1a, e1b)
@@ -39,44 +47,48 @@ def build_fp4():
     p = B.AND(t, c0)
     E2 = B.OR(g, p)
 
-    # K = ma + mb in {0,1,2} -> 3^K is a fixed 4-bit pattern (1,3,9) picked
-    # by K, no multiplier needed: bit0 always set, bit1 set iff K==1 (K0),
-    # bit3 set iff K==2 (K1), bit2 never set
+    # K = ma + mb in {0,1,2} -> bit1 of 3^K set iff K==1 (K0), bit3 set iff
+    # K==2 (K1)
     K0 = B.XOR(ma, mb)
     K1 = B.AND(ma, mb)
-    MP = ['CONST1', K0, 'CONST0', K1]
 
-    # barrel-shift MP (4 bits) by E (0..6) into a 9-bit field -- same
-    # 3-stage style as before (shifted-in bits are known 0, so most muxes
-    # collapse to a single AND)
-    def shift_stage(bits, sel, amount):
-        n = B.NOT(sel)
-        out = []
-        for j in range(len(bits) + amount):
-            hi = bits[j] if j < len(bits) else None
-            lo = bits[j - amount] if 0 <= j - amount < len(bits) else None
-            if hi is not None and lo is not None:
-                out.append(B.OR(B.AND(hi, n), B.AND(lo, sel)))
-            elif hi is not None:
-                out.append(B.AND(hi, n))
-            else:
-                out.append(B.AND(lo, sel))
-        return out
+    # thermometer code t_j = [E <= j]
+    nE2 = B.NOT(E2)
+    u = B.OR(E1, E0)
+    v = B.AND(E1, E0)
+    t0 = B.NOT(B.OR(E2, u))
+    t1 = B.NOT(B.OR(E2, E1))
+    t2 = B.AND(nE2, B.NOT(v))
+    t3 = nE2
+    t4 = B.NOT(B.AND(E2, u))
+    t5 = B.NOT(B.AND(E2, E1))
+    T = [t0, t1, t2, t3, t4, t5, 'CONST1', 'CONST1']
 
-    S1 = shift_stage(MP, E0, 1)
-    S2 = shift_stage(S1, E1, 2)
-    U = shift_stage(S2, E2, 4)[:9]
+    # onehot decoder d_j = t_j ^ t_{j-1} -- this replaces the barrel shifter
+    d = [t0]
+    for j in range(1, 7):
+        d.append(B.XOR(T[j], T[j - 1]))
+    d.append('CONST0')  # E never reaches 7, so d7 is always 0
 
-    # sign + conditional two's complement, folded into one XOR+ripple-carry
-    # pass, then mask the whole result with ~is_zero
-    y = [B.XOR(u, s) for u in U]
-    out = [B.XOR(y[0], s)]
-    carry = B.AND(y[0], s)
-    for j in range(1, 9):
-        out.append(B.XOR(y[j], carry))
-        if j < 8:
-            carry = B.AND(y[j], carry)
-    out = [B.AND(o, nz) for o in out]
+    # unsigned product bits: bit0 of 3^K always set -> d_j; bit1 set iff
+    # K==1 -> K0 & d_{j-1}; bit3 set iff K==2 -> K1 & d_{j-3}
+    P = [None] * 9
+    P[0] = d[0]
+    for j in range(1, 7):
+        acc = B.OR(d[j], B.AND(K0, d[j - 1]))
+        if j >= 3:
+            acc = B.OR(acc, B.AND(K1, d[j - 3]))
+        P[j] = acc
+    P[7] = B.AND(K1, d[4])
+    P[8] = 'CONST0'
+
+    # signed output: flip bits above E when negative (same thermometer
+    # chain used for the shift), then mask to 0 if either operand was zero
+    out = []
+    Tm1 = ['CONST0'] + T
+    for j in range(9):
+        core = B.XOR(P[j], B.AND(s, Tm1[j]))
+        out.append(B.AND(core, nz))
     return B.gates, out
 
 
